@@ -45,6 +45,8 @@ class MMModemInterface(ServiceInterface):
         self.ofono_modem = self.ofono_proxy['org.ofono.Modem']
         self.ofono_interfaces = {}
         self.ofono_interface_props = DBusInterfaceProperties(self.ofono_proxy, verbose)
+        self._ofono_interface_lock = asyncio.Lock()
+        self._ofono_property_callbacks = {}
         self.mm_cell_type = 0 # on runtime unknown MM_CELL_TYPE_UNKNOWN
         self.mm_sim_interface = None
         self.mm_modem3gpp_interface = None
@@ -135,26 +137,42 @@ class MMModemInterface(ServiceInterface):
 
         self.bus.export(f'/org/freedesktop/ModemManager1/Modem/{index}', self)
 
+        self.ofono_interface_props['org.ofono.Modem'].on('*', self.ofono_changed)
         self.loop.create_task(self.init_ofono_interfaces())
-        self.ofono_modem.on_property_changed(self.ofono_changed)
 
     async def init_ofono_interfaces(self):
         ofono2mm_print("Initialize oFono interfaces", self.verbose)
 
-        promises = []
-        for iface in self.used_interfaces:
-            promises.append(self.add_ofono_interface(iface))
-
-        await asyncio.gather(*promises)
+        await self.add_ofono_interface('org.ofono.Modem')
+        modem_props = self.ofono_interface_props['org.ofono.Modem']
+        interfaces = modem_props.props.get('Interfaces', Variant('as', [])).value
+        await self.sync_ofono_interfaces(interfaces)
 
         await self.set_props()
         self.loop.create_task(self.init_connection_manager())
 
         await self.release_request_modemmanager()
 
+    async def sync_ofono_interfaces(self, interfaces):
+        # oFono invalidates an interface's data when it disappears. In
+        # particular, registration may return after the modem goes online
+        # without emitting Status or Strength again: read a fresh snapshot.
+        async with self._ofono_interface_lock:
+            wanted = (set(interfaces) & self.used_interfaces) | {'org.ofono.Modem'}
+            for iface in set(self.ofono_interfaces) - wanted:
+                ofono2mm_print(f"Removing unavailable oFono interface {iface}", self.verbose)
+                self.ofono_interfaces.pop(iface)
+                self.ofono_interface_props[iface].invalidate()
+
+            await asyncio.gather(*(self.add_ofono_interface(iface)
+                                   for iface in wanted - self.ofono_interfaces.keys()))
+
     async def add_ofono_interface(self, iface):
         if iface not in self.used_interfaces:
             ofono2mm_print(f"Interface is {iface} which is unused, skipping", self.verbose)
+            return
+
+        if iface in self.ofono_interfaces:
             return
 
         retries_left = 5
@@ -184,8 +202,10 @@ class MMModemInterface(ServiceInterface):
         if self.mm_modem_signal_interface:
             self.mm_modem_signal_interface.ofono_interface_props = self.ofono_interface_props
 
-        if iface not in self.interfaces_without_props:
-            self.ofono_interface_props[iface].on('*', self.ofono_interface_changed(iface))
+        if iface not in self.interfaces_without_props and iface != 'org.ofono.Modem':
+            if iface not in self._ofono_property_callbacks:
+                self._ofono_property_callbacks[iface] = self.ofono_interface_changed(iface)
+            self.ofono_interface_props[iface].on('*', self._ofono_property_callbacks[iface])
 
         if self.mm_modem3gpp_interface:
             await self.mm_modem3gpp_interface.set_props()
@@ -685,11 +705,8 @@ class MMModemInterface(ServiceInterface):
 
         self.loop.create_task(self.init_connection_manager())
 
-        promises = []
-        for iface in self.used_interfaces:
-            promises.append(self.add_ofono_interface(iface))
-
-        await asyncio.gather(*promises)
+        interfaces = self.ofono_interface_props['org.ofono.Modem'].props.get('Interfaces', Variant('as', [])).value
+        await self.sync_ofono_interfaces(interfaces)
 
         await self.release_request_modemmanager()
 
@@ -1584,6 +1601,8 @@ class MMModemInterface(ServiceInterface):
         return protocol
 
     async def ofono_changed(self, name, varval):
+        if name == 'Interfaces':
+            await self.sync_ofono_interfaces(varval.value)
         await self.set_props()
         if self.mm_modem3gpp_interface:
             self.mm_modem3gpp_interface.ofono_changed(name, varval)
