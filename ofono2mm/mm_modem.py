@@ -1059,7 +1059,6 @@ class MMModemInterface(ServiceInterface):
 
         ofono2mm_print(f"Creating bearer {bearer_i} with properties: {properties}", self.verbose)
         mm_bearer_interface = MMBearerInterface(self.ofono_client, self.modem_name, self.ofono_interfaces, self, self.verbose)
-        self.mm_bearer_interfaces.append(mm_bearer_interface)
         mm_bearer_interface.props.update({
             "Properties": Variant('a{sv}', properties)
         })
@@ -1107,6 +1106,8 @@ class MMModemInterface(ServiceInterface):
 
         self.props['Bearers'].value.append(object_path)
         self.bearers[object_path] = mm_bearer_interface
+        # Failed activation attempts must not remain in the update list.
+        self.mm_bearer_interfaces.append(mm_bearer_interface)
 
         if object_path not in self.mm_interface_objects:
             self.mm_interface_objects.append(object_path)
