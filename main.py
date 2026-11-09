@@ -5,7 +5,6 @@ import sys
 from os import environ
 from argparse import ArgumentParser
 
-from dbus_fast.aio import MessageBus
 from dbus_fast.service import (ServiceInterface,
                                method, dbus_property)
 from dbus_fast.constants import PropertyAccess
@@ -13,6 +12,7 @@ from dbus_fast import DBusError, BusType, Variant
 
 from ofono2mm import MMModemInterface, Ofono, DBus
 from ofono2mm.logging import ofono2mm_print
+from ofono2mm.mm_message_bus import MMMessageBus
 from typing import Dict
 
 def get_version():
@@ -257,7 +257,7 @@ async def main():
     else:
         verbose = args.verbose
 
-    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    bus = await MMMessageBus(bus_type=BusType.SYSTEM).connect()
     loop = asyncio.get_running_loop()
 
     mm_manager_interface = MMInterface(loop, bus, verbose=verbose)

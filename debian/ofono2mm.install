@@ -9,6 +9,7 @@ usr/lib/ofono2mm/ofono2mm/logging.py
 usr/lib/ofono2mm/ofono2mm/mm_bearer.py
 usr/lib/ofono2mm/ofono2mm/mm_call.py
 usr/lib/ofono2mm/ofono2mm/mm_cbm.py
+usr/lib/ofono2mm/ofono2mm/mm_message_bus.py
 usr/lib/ofono2mm/ofono2mm/mm_modem.py
 usr/lib/ofono2mm/ofono2mm/mm_modem_3gpp.py
 usr/lib/ofono2mm/ofono2mm/mm_modem_3gpp_profile_manager.py
