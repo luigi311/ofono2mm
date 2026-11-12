@@ -259,6 +259,10 @@ class MMBearerInterface(ServiceInterface):
 
     @async_retryable()
     async def activate_ofono_context(self, ofono_ctx_interface, protocol):
+        async with self.mm_modem.context_lock(self.ofono_ctx):
+            await self._activate_ofono_context(ofono_ctx_interface, protocol)
+
+    async def _activate_ofono_context(self, ofono_ctx_interface, protocol):
         # Re-activating a context that is already up would tear down a live PDN.
         if await self.adopt_active_context(ofono_ctx_interface):
             ofono2mm_print(f"oFono context {self.ofono_ctx} is already active on {self.props['Interface'].value}", self.verbose)
@@ -333,7 +337,8 @@ class MMBearerInterface(ServiceInterface):
         try:
             if not self.ofono_ctx:
                 raise Exception("No oFono context set for bearer")
-            await self._context_interface.call_set_property("Active", Variant('b', False))
+            async with self.mm_modem.context_lock(self.ofono_ctx):
+                await self._context_interface.call_set_property("Active", Variant('b', False))
         finally:
             self.disconnecting = False
 
@@ -467,7 +472,8 @@ class BearerConnectionMonitor:
 
         down_contexts = {}
         for path, bearers in contexts.items():
-            if any(bearer.disconnecting or bearer.active_connect for bearer in bearers):
+            if (any(bearer.disconnecting or bearer.active_connect for bearer in bearers)
+                    or self.modem.context_lock(path).locked()):
                 continue
             interfaces = {bearer.props['Interface'].value for bearer in bearers
                           if bearer.props['Connected'].value and bearer.props['Interface'].value}

@@ -66,6 +66,7 @@ class MMModemInterface(ServiceInterface):
         self.selected_current_mode = []
         self.sim = Variant('o', f'/org/freedesktop/ModemManager1/SIM/{self.index}')
         self.bearers = {}
+        self._context_locks = {}
         self._closed = False
         self.bearer_monitor = BearerConnectionMonitor(self)
 
@@ -431,6 +432,9 @@ class MMModemInterface(ServiceInterface):
     def get_mm_modem_simple_interface(self):
         return self.mm_modem_simple_interface
 
+    def context_lock(self, path):
+        return self._context_locks.setdefault(path, asyncio.Lock())
+
     def _state_with_bearers(self, state):
         if state not in (ModemState.REGISTERED, ModemState.CONNECTED):
             return state
@@ -447,63 +451,65 @@ class MMModemInterface(ServiceInterface):
             self.emit_properties_changed({'State': state})
 
     async def recover_bearer_context(self, path):
-        def context_bearers():
-            return [bearer for bearer in self.bearers.values() if bearer.ofono_ctx == path]
+        # Serialize with Connect/Disconnect operations sharing this context.
+        async with self.context_lock(path):
+            def context_bearers():
+                return [bearer for bearer in self.bearers.values() if bearer.ofono_ctx == path]
 
-        def can_recover():
-            if self._closed or not self.enabled or self.props['State'].value < ModemState.REGISTERED:
-                return False
-            bearers = context_bearers()
-            return (any(bearer.props['Connected'].value for bearer in bearers)
-                    and not any(bearer.disconnecting or bearer.active_connect for bearer in bearers))
+            def can_recover():
+                if self._closed or not self.enabled or self.props['State'].value < ModemState.REGISTERED:
+                    return False
+                bearers = context_bearers()
+                return (any(bearer.props['Connected'].value for bearer in bearers)
+                        and not any(bearer.disconnecting or bearer.active_connect for bearer in bearers))
 
-        if not can_recover():
-            return
-        modem_props = self.ofono_interface_props['org.ofono.Modem'].props
-        if not all(modem_props.get(prop, Variant('b', False)).value for prop in ('Powered', 'Online')):
-            return
-        manager = self.ofono_proxy['org.ofono.ConnectionManager']
-        manager_props = await asyncio.wait_for(
-            manager.call_get_properties(), timeout=5)
-        if (manager_props.get('Suspended', Variant('b', False)).value
-                or not manager_props.get('Powered', Variant('b', True)).value):
-            return
-        context = self.ofono_client['ofono_context'][path]['org.ofono.ConnectionContext']
-        context_props = await asyncio.wait_for(
-            context.call_get_properties(), timeout=5)
-        # A user may have disconnected while the D-Bus calls were in flight.
-        if not can_recover() or context_props.get('Type', Variant('s', '')).value != 'internet':
-            return
-        inactive = Variant('b', False)
-        if not context_props.get('Active', inactive).value:
-            for bearer in context_bearers():
-                bearer.ofono_context_changed('Active', inactive)
-            return
-        ipv4_settings = context_props.get('Settings', Variant('a{sv}', {})).value
-        ipv6_settings = context_props.get('IPv6.Settings', Variant('a{sv}', {})).value
-        interface = ipv4_settings.get('Interface') or ipv6_settings.get('Interface')
-        if interface is None:
-            return
-        if self.bearer_monitor.link_is_up(interface.value) is not False:
-            # A context may have rotated to a healthy interface while we read
-            # its properties. Refresh aliases rather than bouncing the PDN.
-            for bearer in context_bearers():
-                for name in ('Settings', 'IPv6.Settings', 'Active'):
-                    if name in context_props:
-                        bearer.ofono_context_changed(name, context_props[name])
-            return
-        ofono2mm_print(f"Data context {path} reports active but {interface.value} stayed down; clearing it", self.verbose)
-        try:
-            await asyncio.wait_for(
-                context.call_set_property('Active', inactive), timeout=10)
-        finally:
-            # Announce the loss even if oFono omitted the signal or the reset
-            # failed. NM owns reconnection policy; never enable WWAN here.
-            if not self._closed:
+            if not can_recover():
+                return
+            modem_props = self.ofono_interface_props['org.ofono.Modem'].props
+            if not all(modem_props.get(prop, Variant('b', False)).value for prop in ('Powered', 'Online')):
+                return
+            manager = self.ofono_proxy['org.ofono.ConnectionManager']
+            manager_props = await asyncio.wait_for(
+                manager.call_get_properties(), timeout=5)
+            if (manager_props.get('Suspended', Variant('b', False)).value
+                    or not manager_props.get('Powered', Variant('b', True)).value):
+                return
+            context = self.ofono_client['ofono_context'][path]['org.ofono.ConnectionContext']
+            context_props = await asyncio.wait_for(
+                context.call_get_properties(), timeout=5)
+            # A user may have disconnected while the D-Bus calls were in flight.
+            if not can_recover() or context_props.get('Type', Variant('s', '')).value != 'internet':
+                return
+            inactive = Variant('b', False)
+            if not context_props.get('Active', inactive).value:
                 for bearer in context_bearers():
-                    interface = bearer.props['Interface'].value
-                    if interface and self.bearer_monitor.link_is_up(interface) is False:
-                        bearer.ofono_context_changed('Active', inactive)
+                    bearer.ofono_context_changed('Active', inactive)
+                return
+            ipv4_settings = context_props.get('Settings', Variant('a{sv}', {})).value
+            ipv6_settings = context_props.get('IPv6.Settings', Variant('a{sv}', {})).value
+            interface = ipv4_settings.get('Interface') or ipv6_settings.get('Interface')
+            if interface is None:
+                return
+            if self.bearer_monitor.link_is_up(interface.value) is not False:
+                # A context may have rotated to a healthy interface while we read
+                # its properties. Refresh aliases rather than bouncing the PDN.
+                for bearer in context_bearers():
+                    for name in ('Settings', 'IPv6.Settings', 'Active'):
+                        if name in context_props:
+                            bearer.ofono_context_changed(name, context_props[name])
+                return
+            ofono2mm_print(f"Data context {path} reports active but {interface.value} stayed down; clearing it", self.verbose)
+            try:
+                await asyncio.wait_for(
+                    context.call_set_property('Active', inactive), timeout=10)
+            finally:
+                # Announce the loss even if oFono omitted the signal or the reset
+                # failed. NM owns reconnection policy; never enable WWAN here.
+                if not self._closed:
+                    for bearer in context_bearers():
+                        interface = bearer.props['Interface'].value
+                        if interface and self.bearer_monitor.link_is_up(interface) is False:
+                            bearer.ofono_context_changed('Active', inactive)
 
     async def check_ofono_contexts(self):
         ofono2mm_print("Checking ofono contexts", self.verbose)
@@ -1153,12 +1159,13 @@ class MMModemInterface(ServiceInterface):
                 await context.call_set_property("Password", Variant('s', password))
             else:
                 # Reuse a live context without bouncing it when the protocol matches.
-                props = await context.call_get_properties()
-                if not (props.get('Active', Variant('b', False)).value
-                        and props.get('Protocol', Variant('s', '')).value == protocol):
-                    await context.call_set_property("Active", Variant('b', False))
-                    await context.call_set_property("Protocol", Variant('s', protocol))
-                    await context.call_set_property("Active", Variant('b', True))
+                async with self.context_lock(ofono_ctx):
+                    props = await context.call_get_properties()
+                    if not (props.get('Active', Variant('b', False)).value
+                            and props.get('Protocol', Variant('s', '')).value == protocol):
+                        await context.call_set_property("Active", Variant('b', False))
+                        await context.call_set_property("Protocol", Variant('s', protocol))
+                        await context.call_set_property("Active", Variant('b', True))
 
             object_path = f'/org/freedesktop/ModemManager1/Bearer/{bearer_i}'
             bearer.own_object_path = object_path
